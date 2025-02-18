@@ -206,6 +206,9 @@ class KubeSpawner(Spawner):
         self.secret_name = self._expand_user_properties(self.secret_name_template)
 
         self.pvc_name = self._expand_user_properties(self.pvc_name_template)
+
+        self.extra_pvc_specs = []
+
         # _pvc_exists indicates whether we've checked at least once that our pvc name is right
         # only persist pvc name in state if pvc exists
         self._pvc_exists = False  # initialized from load_state or start
@@ -2425,6 +2428,58 @@ class KubeSpawner(Spawner):
             annotations=annotations,
         )
 
+    def get_extra_pvc_manifest(self, extra_pvc_spec):
+        """
+        Make a pvc manifest that will spawn current user's pvc.
+        """
+        labels = self._build_common_labels(self._expand_all(extra_pvc_spec['labels']))
+        labels.update(
+            {
+                # The component label has been set to singleuser-storage, but should
+                # probably have been set to singleuser-server (self.component_label)
+                # as that ties it to the user pods kubespawner creates. Due to that,
+                # the newly introduced label app.kubernetes.io/component gets
+                # singleuser-server (self.component_label) as a value instead.
+                'app.kubernetes.io/component': self.component_label,
+                'component': 'singleuser-storage',
+            }
+        )
+
+        annotations = self._build_common_annotations(
+            self._expand_all(extra_pvc_spec['annotations'])
+        )
+
+        storage_selector = self._expand_all(extra_pvc_spec['selector'])
+
+        return make_pvc(
+            name=extra_pvc_spec['extra_pvc_name'],
+            storage_class=self.storage_class,
+            access_modes=extra_pvc_spec['access_modes'],
+            selector=storage_selector,
+            storage=extra_pvc_spec['capacity'],
+            labels=labels,
+            annotations=annotations,
+        )
+
+    def add_extra_pvc_by_spec(
+            self,
+            extra_pvc_name,
+            access_modes=None,
+            selector=None,
+            capacity=None,
+            labels=None,
+            annotations=None
+    ):
+        self.extra_pvc_specs.append(dict(
+            extra_pvc_name=self._expand_user_properties(extra_pvc_name),
+            access_modes=access_modes if access_modes else self.storage_access_modes,
+            selector=selector if selector else self.storage_selector,
+            capacity=capacity if capacity else self.storage_capacity,
+            labels=labels if labels else self.storage_extra_labels,
+            annotations=annotations if annotations else self.storage_extra_annotations
+        ))
+        return self._expand_user_properties(extra_pvc_name)
+
     def is_pod_running(self, pod):
         """
         Check if the given pod is running
@@ -3141,6 +3196,17 @@ class KubeSpawner(Spawner):
                 # Each req should be given k8s_api_request_timeout seconds.
                 timeout=self.k8s_api_request_retry_timeout,
             )
+
+            for extra_pvc_spec in self.extra_pvc_specs:
+                extra_pvc = self.get_extra_pvc_manifest(extra_pvc_spec)
+                await exponential_backoff(
+                    partial(
+                        self._make_create_pvc_request, extra_pvc, self.k8s_api_request_timeout
+                    ),
+                    f'Could not create PVC {extra_pvc.metadata.name}',
+                    timeout=self.k8s_api_request_retry_timeout,
+                )
+
             # indicate that pvc name is known and should be persisted
             self._pvc_exists = True
 
